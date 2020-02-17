@@ -27,6 +27,7 @@ from torch import nn
 import torchvision
 import torchvision.models.detection
 import torchvision.models.detection.mask_rcnn
+from torchvision.models.detection.faster_rcnn import FastRCNNPredictor
 
 from coco_utils import get_coco, get_coco_kp
 
@@ -36,16 +37,13 @@ from engine import train_one_epoch, evaluate
 import utils
 import transforms as T
 
+from staff_dataset import StaffDataset
 
-def get_dataset(name, image_set, transform, data_path):
-    paths = {
-        "coco": (data_path, get_coco, 91),
-        "coco_kp": (data_path, get_coco_kp, 2)
-    }
-    p, ds_fn, num_classes = paths[name]
 
-    ds = ds_fn(p, image_set=image_set, transforms=transform)
-    return ds, num_classes
+def get_dataset(transform, root):
+    num_classes = 2
+    dataset = StaffDataset(root, transforms=transform)
+    return dataset, num_classes
 
 
 def get_transform(train):
@@ -65,16 +63,12 @@ def main(args):
     # Data loading code
     print("Loading data")
 
-    dataset, num_classes = get_dataset(args.dataset, "train", get_transform(train=True), args.data_path)
-    dataset_test, _ = get_dataset(args.dataset, "val", get_transform(train=False), args.data_path)
+    dataset, num_classes = get_dataset(get_transform(train=True), f'{args.data_path}/train')
+    dataset_test, _ = get_dataset(get_transform(train=False), f'{args.data_path}/validation')
 
     print("Creating data loaders")
-    if args.distributed:
-        train_sampler = torch.utils.data.distributed.DistributedSampler(dataset)
-        test_sampler = torch.utils.data.distributed.DistributedSampler(dataset_test)
-    else:
-        train_sampler = torch.utils.data.RandomSampler(dataset)
-        test_sampler = torch.utils.data.SequentialSampler(dataset_test)
+    train_sampler = torch.utils.data.RandomSampler(dataset)
+    test_sampler = torch.utils.data.SequentialSampler(dataset_test)
 
     if args.aspect_ratio_group_factor >= 0:
         group_ids = create_aspect_ratio_groups(dataset, k=args.aspect_ratio_group_factor)
@@ -93,8 +87,13 @@ def main(args):
         collate_fn=utils.collate_fn)
 
     print("Creating model")
-    model = torchvision.models.detection.__dict__[args.model](num_classes=num_classes,
-                                                              pretrained=args.pretrained)
+    model = torchvision.models.detection.fasterrcnn_resnet50_fpn(pretrained=True)
+    num_classes = 2
+    in_features = model.roi_heads.box_predictor.cls_score.in_features
+    model.roi_heads.box_predictor = FastRCNNPredictor(in_features, num_classes)
+
+    # model = torchvision.models.detection.__dict__[args.model](num_classes=num_classes,
+    #                                                           pretrained=args.pretrained)
     model.to(device)
 
     model_without_ddp = model
@@ -106,7 +105,6 @@ def main(args):
     optimizer = torch.optim.SGD(
         params, lr=args.lr, momentum=args.momentum, weight_decay=args.weight_decay)
 
-    # lr_scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=args.lr_step_size, gamma=args.lr_gamma)
     lr_scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, milestones=args.lr_steps, gamma=args.lr_gamma)
 
     if args.resume:
@@ -129,8 +127,8 @@ def main(args):
         lr_scheduler.step()
         if args.output_dir:
             utils.save_on_master({
-                'model': model_without_ddp.state_dict(),
-                'optimizer': optimizer.state_dict(),
+                'model_state_dict': model_without_ddp.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
                 'lr_scheduler': lr_scheduler.state_dict(),
                 'args': args,
                 'epoch': epoch},
